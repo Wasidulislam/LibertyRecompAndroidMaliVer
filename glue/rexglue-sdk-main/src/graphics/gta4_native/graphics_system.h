@@ -173,6 +173,10 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     std::array<VkShaderModule, 4> colorless_modules{};
     std::string filename;
     std::vector<NativeVertexInput> vertex_inputs;
+    // Vulkan attribute locations after applying maxVertexInputAttributes.
+    // vertex_inputs keeps the original GTA IV semantic locations so declaration
+    // matching and payload conversion remain unchanged.
+    std::vector<uint32_t> vertex_input_locations;
     // Reads gl_VertexIndex/gl_InstanceIndex: its draws cannot be concatenated.
     bool uses_vertex_index = false;
     // Bytes of this stage's guest constant bank any of its modules can read
@@ -1476,6 +1480,13 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   bool InitializeShaderCache();
   static bool ReflectVertexInputs(const std::vector<uint32_t>& spirv,
                                   std::vector<NativeVertexInput>& inputs);
+  static bool BuildVertexInputLocationMap(const std::vector<NativeVertexInput>& inputs,
+                                          uint32_t limit, std::vector<uint32_t>& locations,
+                                          std::string& error);
+  static bool RemapSpirvVertexInputLocations(std::vector<uint32_t>& spirv,
+                                             const std::vector<NativeVertexInput>& inputs,
+                                             const std::vector<uint32_t>& locations,
+                                             std::string& error);
   ShaderOverrideSelection ResolvePipelineShaderOverrides(
       const NativeShader* vertex_shader, const NativeShader* pixel_shader,
       VkSampleCountFlagBits rasterization_samples) const;

@@ -71,6 +71,34 @@ VkShaderModule Gta4NativeGraphicsSystem::GetTemporalShaderModule(
   if (REXCVAR_GET(gta4_native_loop_watchdog)) {
     if (auto guarded = AddSpirvLoopWatchdog(module, 16384)) module = std::move(guarded->words);
   }
+  if (stage == temporal::ShaderStage::kVertex && shader) {
+    if (shader->vertex_input_locations.size() != shader->vertex_inputs.size()) {
+      REXLOG_ERROR("gta4-native-temporal: shader {:016X} vertex input location map size mismatch",
+                   hash);
+      return VK_NULL_HANDLE;
+    }
+    // The pipeline binds attributes at vertex_input_locations, so temporal
+    // vertex modules need the same per-shader remap as the stock/override
+    // modules. vertex_inputs retains the original semantic locations.
+    bool remap_required = false;
+    for (size_t i = 0; i < shader->vertex_inputs.size(); ++i) {
+      if (shader->vertex_inputs[i].location != shader->vertex_input_locations[i]) {
+        remap_required = true;
+        break;
+      }
+    }
+    if (remap_required) {
+      std::string error;
+      if (!RemapSpirvVertexInputLocations(module, shader->vertex_inputs,
+                                          shader->vertex_input_locations, error)) {
+        REXLOG_ERROR(
+            "gta4-native-temporal: shader {:016X} vertex input-location remap failed "
+            "override={} late={}: {}",
+            hash, overridden, late, error);
+        return VK_NULL_HANDLE;
+      }
+    }
+  }
   if (stage == temporal::ShaderStage::kPixel) {
     std::string error;
     auto transformed = AddNativeColorOutputEpilogue(module, &error, 0x70u);

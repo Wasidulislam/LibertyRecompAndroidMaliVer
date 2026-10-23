@@ -8038,6 +8038,165 @@ bool Gta4NativeGraphicsSystem::ReflectVertexInputs(const std::vector<uint32_t>& 
                             }) == inputs.end();
 }
 
+bool Gta4NativeGraphicsSystem::BuildVertexInputLocationMap(
+    const std::vector<NativeVertexInput>& inputs, uint32_t limit, std::vector<uint32_t>& locations,
+    std::string& error) {
+  locations.clear();
+  locations.reserve(inputs.size());
+  if (inputs.size() > limit) {
+    error = fmt::format("{} vertex inputs exceed the device maxVertexInputAttributes={}",
+                        inputs.size(), limit);
+    return false;
+  }
+  // ReflectVertexInputs sorts by location and rejects duplicates. Recheck here
+  // because the mapping below relies on both properties for deterministic
+  // allocation of the lowest unused locations.
+  for (size_t i = 1; i < inputs.size(); ++i) {
+    if (inputs[i - 1].location >= inputs[i].location) {
+      error = "vertex input locations are duplicate or not sorted";
+      return false;
+    }
+  }
+
+  std::vector<bool> used(limit, false);
+  for (const NativeVertexInput& input : inputs) {
+    if (input.location < limit) {
+      used[input.location] = true;
+    }
+  }
+
+  uint32_t next_free = 0;
+  for (const NativeVertexInput& input : inputs) {
+    if (input.location < limit) {
+      locations.push_back(input.location);
+      continue;
+    }
+    while (next_free < limit && used[next_free]) {
+      ++next_free;
+    }
+    if (next_free >= limit) {
+      error = fmt::format("no free location remains for vertex input location {}", input.location);
+      return false;
+    }
+    used[next_free] = true;
+    locations.push_back(next_free);
+    ++next_free;
+  }
+  return true;
+}
+
+bool Gta4NativeGraphicsSystem::RemapSpirvVertexInputLocations(
+    std::vector<uint32_t>& spirv, const std::vector<NativeVertexInput>& inputs,
+    const std::vector<uint32_t>& locations, std::string& error) {
+  if (spirv.size() < 5 || spirv[0] != kSpirvMagic || !spirv[3]) {
+    error = "malformed SPIR-V module";
+    return false;
+  }
+  if (inputs.size() != locations.size()) {
+    error = "vertex input location map size mismatch";
+    return false;
+  }
+
+  constexpr size_t kHeaderWordCount = 5;
+  const uint32_t id_bound = spirv[3];
+  std::vector<uint8_t> input_variables(id_bound, 0);
+  std::vector<uint8_t> decorated_input_locations(id_bound, 0);
+  std::vector<uint32_t> input_locations(id_bound, UINT32_MAX);
+  bool vertex_entry_point = false;
+
+  size_t cursor = kHeaderWordCount;
+  while (cursor < spirv.size()) {
+    const uint32_t instruction = spirv[cursor];
+    const uint32_t word_count = instruction >> 16;
+    const spv::Op opcode = spv::Op(instruction & 0xFFFFu);
+    if (!word_count || word_count > spirv.size() - cursor) {
+      error = "malformed SPIR-V instruction stream";
+      return false;
+    }
+    const uint32_t* words = spirv.data() + cursor;
+    switch (opcode) {
+      case spv::Op::OpEntryPoint:
+        if (word_count >= 4 && words[1] == uint32_t(spv::ExecutionModel::Vertex)) {
+          vertex_entry_point = true;
+        }
+        break;
+      case spv::Op::OpVariable:
+        if (word_count >= 4 && words[2] < id_bound &&
+            words[3] == uint32_t(spv::StorageClass::Input)) {
+          input_variables[words[2]] = 1;
+        }
+        break;
+      case spv::Op::OpDecorate:
+        if (word_count >= 4 && words[1] < id_bound &&
+            words[2] == uint32_t(spv::Decoration::Location)) {
+          if (decorated_input_locations[words[1]]) {
+            error = fmt::format("input variable {} has multiple Location decorations", words[1]);
+            return false;
+          }
+          decorated_input_locations[words[1]] = 1;
+          input_locations[words[1]] = words[3];
+        }
+        break;
+      default:
+        break;
+    }
+    cursor += word_count;
+  }
+
+  if (!vertex_entry_point) {
+    error = "SPIR-V module has no vertex entry point";
+    return false;
+  }
+
+  std::vector<uint32_t> remapped_by_id(id_bound, UINT32_MAX);
+  std::vector<bool> matched(inputs.size(), false);
+  for (uint32_t id = 0; id < id_bound; ++id) {
+    if (!input_variables[id] || !decorated_input_locations[id]) {
+      continue;
+    }
+    const uint32_t old_location = input_locations[id];
+    const auto input = std::find_if(inputs.begin(), inputs.end(),
+                                    [old_location](const NativeVertexInput& candidate) {
+                                      return candidate.location == old_location;
+                                    });
+    if (input == inputs.end()) {
+      error =
+          fmt::format("input variable {} location {} is not part of the reflected vertex interface",
+                      id, old_location);
+      return false;
+    }
+    const size_t index = size_t(input - inputs.begin());
+    if (matched[index]) {
+      error = fmt::format("multiple input variables use vertex location {}", old_location);
+      return false;
+    }
+    matched[index] = true;
+    remapped_by_id[id] = locations[index];
+  }
+  if (std::find(matched.begin(), matched.end(), false) != matched.end()) {
+    error = "reflected vertex input is missing its Input variable Location decoration";
+    return false;
+  }
+
+  cursor = kHeaderWordCount;
+  while (cursor < spirv.size()) {
+    const uint32_t instruction = spirv[cursor];
+    const uint32_t word_count = instruction >> 16;
+    const spv::Op opcode = spv::Op(instruction & 0xFFFFu);
+    if (!word_count || word_count > spirv.size() - cursor) {
+      error = "malformed SPIR-V instruction stream";
+      return false;
+    }
+    uint32_t* words = spirv.data() + cursor;
+    if (opcode == spv::Op::OpDecorate && word_count >= 4 && words[1] < id_bound &&
+        words[2] == uint32_t(spv::Decoration::Location) && remapped_by_id[words[1]] != UINT32_MAX) {
+      words[3] = remapped_by_id[words[1]];
+    }
+    cursor += word_count;
+  }
+  return true;
+}
+
 ShaderOverrideSelection Gta4NativeGraphicsSystem::ResolvePipelineShaderOverrides(
     const NativeShader* vertex_shader, const NativeShader* pixel_shader,
     VkSampleCountFlagBits rasterization_samples) const {
@@ -8368,6 +8527,57 @@ void Gta4NativeGraphicsSystem::RegisterShader(const RegisterShaderCommand& comma
       apply_relaxed(stock_late_spirv);
       stock_late_spirv_size = stock_late_spirv.size() * sizeof(uint32_t);
     }
+    std::vector<NativeVertexInput> stock_vertex_inputs;
+    std::vector<uint32_t> stock_vertex_input_locations;
+    bool stock_vertex_location_remap_required = false;
+    if (command.stage == ShaderStage::kVertex) {
+      if (!ReflectVertexInputs(stock_early_spirv, stock_vertex_inputs)) {
+        REXLOG_ERROR("gta4-native: failed to reflect stock vertex inputs for shader {}",
+                     cache_entry->filename);
+        return;
+      }
+      std::string location_error;
+      const uint32_t location_limit = vulkan_device->properties().maxVertexInputAttributes;
+      if (!BuildVertexInputLocationMap(stock_vertex_inputs, location_limit,
+                                       stock_vertex_input_locations, location_error)) {
+        REXLOG_ERROR("gta4-native: rejecting vertex shader {} with {} inputs: {}",
+                     cache_entry->filename, stock_vertex_inputs.size(), location_error);
+        return;
+      }
+      for (size_t i = 0; i < stock_vertex_inputs.size(); ++i) {
+        if (stock_vertex_inputs[i].location != stock_vertex_input_locations[i]) {
+          stock_vertex_location_remap_required = true;
+          break;
+        }
+      }
+      if (stock_vertex_location_remap_required) {
+        if (!RemapSpirvVertexInputLocations(stock_early_spirv, stock_vertex_inputs,
+                                            stock_vertex_input_locations, location_error)) {
+          REXLOG_ERROR(
+              "gta4-native: rejecting vertex shader {}: early input-location remap failed: {}",
+              cache_entry->filename, location_error);
+          return;
+        }
+        if (!stock_late_spirv.empty()) {
+          std::vector<NativeVertexInput> late_inputs;
+          if (!ReflectVertexInputs(stock_late_spirv, late_inputs) ||
+              late_inputs != stock_vertex_inputs) {
+            REXLOG_ERROR(
+                "gta4-native: rejecting vertex shader {}: stock late input interface differs "
+                "while input locations require remapping",
+                cache_entry->filename);
+            return;
+          }
+          if (!RemapSpirvVertexInputLocations(stock_late_spirv, stock_vertex_inputs,
+                                              stock_vertex_input_locations, location_error)) {
+            REXLOG_ERROR(
+                "gta4-native: rejecting vertex shader {}: late input-location remap failed: {}",
+                cache_entry->filename, location_error);
+            return;
+          }
+        }
+      }
+    }
     VkShaderModule stock_early_module = ui::vulkan::util::CreateShaderModule(
         vulkan_device, stock_early_spirv.data(), stock_early_spirv_size);
     if (!stock_early_module) {
@@ -8429,17 +8639,9 @@ void Gta4NativeGraphicsSystem::RegisterShader(const RegisterShaderCommand& comma
         i += count;
       }
     }
-    if (command.stage == ShaderStage::kVertex &&
-        !ReflectVertexInputs(stock_early_spirv, resource->vertex_inputs)) {
-      if (stock_late_module) {
-        profile::CpuCall(profile::CpuOp::kDriverDestruction, [&] { return dfn.vkDestroyShaderModule(device, stock_late_module, nullptr); });
-      }
-      profile::CpuCall(profile::CpuOp::kDriverDestruction, [&] { return dfn.vkDestroyShaderModule(device, stock_early_module, nullptr); });
-      REXLOG_ERROR("gta4-native: failed to reflect stock vertex inputs for shader {}",
-                   cache_entry->filename);
-      return;
-    }
     if (command.stage == ShaderStage::kVertex) {
+      resource->vertex_inputs = std::move(stock_vertex_inputs);
+      resource->vertex_input_locations = std::move(stock_vertex_input_locations);
       uint64_t signature = 0x9E3779B97F4A7C15ull;
       for (const NativeVertexInput& input : resource->vertex_inputs) {
         signature = NativeMixHash(signature ^ (uint64_t(input.location) << 40 ^
@@ -8537,6 +8739,35 @@ void Gta4NativeGraphicsSystem::RegisterShader(const RegisterShaderCommand& comma
         if (!ReflectVertexInputs(override_early_spirv, override_inputs) ||
             override_inputs != resource->vertex_inputs) {
           override_rejection = "vertex-interface";
+        }
+      }
+      if (!override_rejection && command.stage == ShaderStage::kVertex &&
+          stock_vertex_location_remap_required) {
+        std::string location_error;
+        if (!override_late_spirv.empty()) {
+          std::vector<NativeVertexInput> override_late_inputs;
+          if (!ReflectVertexInputs(override_late_spirv, override_late_inputs) ||
+              override_late_inputs != resource->vertex_inputs) {
+            override_rejection = "vertex-interface-late";
+          }
+        }
+        if (!override_rejection &&
+            !RemapSpirvVertexInputLocations(override_early_spirv, resource->vertex_inputs,
+                                            resource->vertex_input_locations, location_error)) {
+          REXLOG_ERROR(
+              "gta4-native-shader-overrides: vertex early input-location remap failed "
+              "stage={} hash={:016X} file={}: {}",
+              stage_name, command.hash, override_entry->filename, location_error);
+          override_rejection = "vertex-location-remap";
+        }
+        if (!override_rejection && !override_late_spirv.empty() &&
+            !RemapSpirvVertexInputLocations(override_late_spirv, resource->vertex_inputs,
+                                            resource->vertex_input_locations, location_error)) {
+          REXLOG_ERROR(
+              "gta4-native-shader-overrides: vertex late input-location remap failed "
+              "stage={} hash={:016X} file={}: {}",
+              stage_name, command.hash, override_entry->filename, location_error);
+          override_rejection = "vertex-location-remap-late";
         }
       }
 
@@ -12051,9 +12282,11 @@ memory::Snapshot Gta4NativeGraphicsSystem::CollectNativeMemorySnapshot(uint32_t 
       continue;
     }
     shader_bytes += sizeof(NativeShader) + shader->filename.capacity() +
-                    shader->vertex_inputs.capacity() * sizeof(NativeVertexInput);
+                    shader->vertex_inputs.capacity() * sizeof(NativeVertexInput) +
+                    shader->vertex_input_locations.capacity() * sizeof(uint32_t);
     shader_logical += sizeof(NativeShader) + shader->filename.size() +
-                      shader->vertex_inputs.size() * sizeof(NativeVertexInput);
+                      shader->vertex_inputs.size() * sizeof(NativeVertexInput) +
+                      shader->vertex_input_locations.size() * sizeof(uint32_t);
   }
   // The pipelined worker registers declarations while the recorder samples.
   static const decltype(vertex_declarations_) kNoDeclarations;
@@ -21857,12 +22090,19 @@ VkPipeline Gta4NativeGraphicsSystem::GetOrCreatePipeline(
   std::array<bool, kVertexStreamCount> binding_used{};
   bool default_binding_used = false;
   const auto& vertex_limits = vulkan_device->properties();
-  if (state.vertex_shader_resource->vertex_inputs.size() > vertex_limits.maxVertexInputAttributes) {
+  const auto& vertex_inputs = state.vertex_shader_resource->vertex_inputs;
+  const auto& vertex_input_locations = state.vertex_shader_resource->vertex_input_locations;
+  if (vertex_inputs.size() > vertex_limits.maxVertexInputAttributes) {
     return reject("vertex-input-attribute-count-limit");
   }
-  attributes.reserve(state.vertex_shader_resource->vertex_inputs.size());
-  for (const NativeVertexInput& shader_input : state.vertex_shader_resource->vertex_inputs) {
-    if (shader_input.location >= vertex_limits.maxVertexInputAttributes) {
+  if (vertex_input_locations.size() != vertex_inputs.size()) {
+    return reject("vertex-input-location-map");
+  }
+  attributes.reserve(vertex_inputs.size());
+  for (size_t input_index = 0; input_index < vertex_inputs.size(); ++input_index) {
+    const NativeVertexInput& shader_input = vertex_inputs[input_index];
+    const uint32_t attribute_location = vertex_input_locations[input_index];
+    if (attribute_location >= vertex_limits.maxVertexInputAttributes) {
       return reject("vertex-input-location-limit");
     }
     const VertexElement* matching_element = nullptr;
@@ -21875,7 +22115,7 @@ VkPipeline Gta4NativeGraphicsSystem::GetOrCreatePipeline(
     }
 
     VkVertexInputAttributeDescription attribute{};
-    attribute.location = shader_input.location;
+    attribute.location = attribute_location;
     if (!matching_element) {
       attribute.binding = kDefaultVertexBinding;
       attribute.format =
