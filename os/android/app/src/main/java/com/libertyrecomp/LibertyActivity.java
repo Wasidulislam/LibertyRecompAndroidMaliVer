@@ -97,6 +97,12 @@ public class LibertyActivity extends SDLActivity {
      */
     @Override
     public void loadLibraries() {
+        // TEMPORARY Mali Vulkan 1.1 diagnostic: pass the Java-side decision to
+        // vulkan_device.cpp through the environment (the same convention as
+        // TU_DEBUG). Writing "0" for every other build also keeps env.txt from
+        // enabling the native bypass on a non-Mali APK.
+        setenv(DriverBridge.MALI_VULKAN_1_1_DIAGNOSTIC_ENV,
+                DriverBridge.allowVulkan11Diagnostic() ? "1" : "0");
         String status = DriverBridge.initialize(this, mDriverMode);
         String reason = DriverBridge.unusableReason(status);
         writeLaunchReport(status, reason);

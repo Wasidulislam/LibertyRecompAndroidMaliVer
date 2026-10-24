@@ -113,11 +113,24 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   if (with_native_shader_support &&
       properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 2, 0)) {
-    REXLOG_WARN(
-        "Vulkan device '{}' exposes API {}.{}, but Liberty native shaders require Vulkan 1.2",
-        properties.deviceName, VK_VERSION_MAJOR(properties.apiVersion),
-        VK_VERSION_MINOR(properties.apiVersion));
-    return nullptr;
+    // TEMPORARY Mali diagnostic: the Mali APK sets this environment variable
+    // from Java (all other builds set it to "0"). Continue past the version
+    // gate so the next real failure is reported; every feature check below
+    // still runs unchanged.
+    const char* allow_vulkan_1_1 = std::getenv("LIBERTY_MALI_ALLOW_VULKAN_1_1");
+    if (allow_vulkan_1_1 && allow_vulkan_1_1[0] == '1') {
+      REXLOG_WARN(
+          "Vulkan device '{}' exposes API {}.{}, below the required 1.2; continuing "
+          "because the temporary Mali Vulkan 1.1 diagnostic is enabled",
+          properties.deviceName, VK_VERSION_MAJOR(properties.apiVersion),
+          VK_VERSION_MINOR(properties.apiVersion));
+    } else {
+      REXLOG_WARN(
+          "Vulkan device '{}' exposes API {}.{}, but Liberty native shaders require Vulkan 1.2",
+          properties.deviceName, VK_VERSION_MAJOR(properties.apiVersion),
+          VK_VERSION_MINOR(properties.apiVersion));
+      return nullptr;
+    }
   }
   if (with_native_shader_support && !supported_features.shaderInt64) {
     REXLOG_WARN(

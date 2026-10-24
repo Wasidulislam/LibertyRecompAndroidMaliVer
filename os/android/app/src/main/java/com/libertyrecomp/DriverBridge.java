@@ -76,10 +76,27 @@ final class DriverBridge {
         return "mali".equals(BuildConfig.GPU_FAMILY);
     }
 
+    /**
+     * TEMPORARY Mali diagnostic: allow a Vulkan 1.1 driver to reach the native
+     * renderer so its next real rejection is visible. Remove this constant and
+     * the matching check in vulkan_device.cpp when the experiment is over.
+     */
+    private static final boolean MALI_VULKAN_1_1_DIAGNOSTIC = true;
+
+    /** The native renderer reads this with getenv; only the Mali APK sets it to "1". */
+    static final String MALI_VULKAN_1_1_DIAGNOSTIC_ENV = "LIBERTY_MALI_ALLOW_VULKAN_1_1";
+
+    /** True only in the Mali APK with the temporary Vulkan 1.1 diagnostic enabled. */
+    static boolean allowVulkan11Diagnostic() {
+        return MALI_VULKAN_1_1_DIAGNOSTIC && isMaliBuild();
+    }
+
     static native String nativeInit(String nativeLibraryDir, String internalDriverDir,
                                     String driverFilename, boolean custom,
                                     boolean allowSystemFallback);
 
+    /** VK_API_VERSION_1_1: only the temporary Mali diagnostic accepts this. */
+    private static final long VULKAN_1_1 = (1L << 22) | (1L << 12);
     /** VK_API_VERSION_1_2: the native renderer's minimum. */
     private static final long VULKAN_1_2 = (1L << 22) | (2L << 12);
 
@@ -196,6 +213,12 @@ final class DriverBridge {
                     + "features the game's renderer requires: " + missing + "."
                     + "\n\nA newer system update may add them. Please attach the launch report "
                     + "when reporting this.";
+        }
+        // TEMPORARY Mali diagnostic: bypass only this Java-side 1.2 version
+        // gate. The native device check still enforces every feature.
+        if (allowVulkan11Diagnostic() && best >= VULKAN_1_1) {
+            Log.w(TAG, "TEMPORARY Mali Vulkan 1.1 diagnostic: ignoring the Java 1.2 version gate");
+            return null;
         }
         String fallbackFrom = json.optString("fallback_from");
         return "This device's GPU (" + name + ") only offers Vulkan " + (best >> 22) + "."
